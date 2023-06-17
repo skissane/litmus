@@ -60,6 +60,8 @@ const char *i_username = NULL, *i_password;
 static char *proxy_hostname = NULL;
 static unsigned int proxy_port;
 
+int i_foo_fd;
+off_t i_foo_len;
 static char *client_certificate = NULL;
 
 const static struct option longopts[] = {
@@ -82,6 +84,23 @@ static void usage(FILE *output)
 	    "    -d PROXY  use PROXY as proxy URL\n"
             "    -c CERT   use a PKCS#12 client certificate\n",
 	    test_argv[0]);
+}
+
+static int open_foo(void)
+{
+    char *foofn = ne_concat(htdocs_root, "/foo", NULL);
+    struct stat st;
+
+    i_foo_fd = open(foofn, O_RDONLY | O_BINARY);
+    if (i_foo_fd < 0) {
+	t_context("could not open %s: %s", foofn, strerror(errno));
+	return FAILHARD;
+    }
+
+    ONV(fstat(i_foo_fd, &st) < 0, ("could not stat file: %s", strerror(errno)));
+    i_foo_len = st.st_size;
+
+    return OK;
 }
 
 static int test_connect(void)
@@ -198,6 +217,8 @@ int init(void)
 	i_path = ne_concat(u.path, "/", NULL);
     }
 
+    i_path = ne_path_escape(i_path);
+
     if (n > 2) {
 	i_username = test_argv[optind+1];
 	i_password = test_argv[optind+2];
@@ -217,6 +238,8 @@ int init(void)
 	CALL(test_resolve(proxy_hostname, "proxy server"));
     else
 	CALL(test_resolve(i_hostname, "server"));
+
+    CALL(open_foo());
 
     CALL(test_connect());
 
@@ -337,41 +360,27 @@ int finish(void)
     return OK;
 }
 
-static int do_put(ne_session *sess, const char *path, const char *content)
-{
-    ne_request *req;
-    int ret;
-
-    req = ne_request_create(sess, "PUT", path);
-    ne_lock_using_resource(req, path, 0);
-    ne_lock_using_parent(req, path);
-    ne_set_request_body_buffer(req, content, strlen(content));
-    ret = ne_request_dispatch(req);
-
-    if (ret == NE_OK && ne_get_status(req)->klass != 2)
-	ret = NE_ERROR;
-
-    ne_request_destroy(req);
-
-    return ret;
-}
-
-int dummy_put(ne_session *sess, const char *path)
-{
-    return do_put(sess, path, "zero");
-}
-
-static const char foo_content[] =
-    "This\nis\na\ntest\nfile\ncalled\nfoo\n";
-
 int upload_foo(const char *path)
 {
     char *uri = ne_concat(i_path, path, NULL);
     int ret;
+    /* i_foo_fd is rewound automagically by ne_request.c */
+    ret = ne_put(i_session, uri, i_foo_fd);
+    if (ret)
+	t_context("PUT of '%s': %s", uri, ne_get_error(i_session));
+    free(uri);
+    return ret;
+}
 
-    ret = do_put(i_session, uri, foo_content);
-
-    ne_free(uri);
+int upload_foo2(const char *path)
+{
+    char *uri = ne_concat(i_path, path, NULL);
+    int ret;
+    /* i_foo_fd is rewound automagically by ne_request.c */
+    ret = ne_put(i_session2, uri, i_foo_fd);
+    if (ret)
+	t_context("PUT of '%s': %s", uri, ne_get_error(i_session2));
+    free(uri);
     return ret;
 }
 
@@ -392,6 +401,20 @@ int options(void)
     return OK;
 }
 
+char *get_lastmodified(const char *path)
+{
+    ne_request *req = ne_request_create(i_session, "HEAD", path);
+    char *lastmodified = NULL;
+
+    if (ne_request_dispatch(req) == NE_OK && ne_get_status(req)->code == 200) {
+	const char *value = ne_get_response_header(req, "Last-Modified");
+	if (value) lastmodified = ne_strdup(value);
+    }
+
+    ne_request_destroy(req);
+    return lastmodified;
+}
+
 char *get_etag(const char *path)
 {
     ne_request *req = ne_request_create(i_session, "HEAD", path);
@@ -404,4 +427,50 @@ char *get_etag(const char *path)
 
     ne_request_destroy(req);
     return etag;
+}
+
+char *create_temp(const char *contents)
+{
+    char tmp[256] = "/tmp/litmus-XXXXXX";
+    int fd;
+    size_t len = strlen(contents);
+
+    fd = mkstemp(tmp);
+    BINARYMODE(fd);
+    if (write(fd, contents, len) != (ssize_t)len) {
+	close(fd);
+	return NULL;
+    }
+    close(fd);
+
+    return ne_strdup(tmp);
+}
+
+int compare_contents(const char *fn, const char *contents)
+{
+    int fd = open(fn, O_RDONLY | O_BINARY), ret;
+    char buffer[BUFSIZ];
+    ne_buffer *b = ne_buffer_create();
+    ssize_t bytes;
+
+    while ((bytes = read(fd, buffer, BUFSIZ)) > 0) {
+	ne_buffer_append(b, buffer, bytes);
+    }
+
+    close(fd);
+
+#define SvsS "%" NE_FMT_SIZE_T " vs %" NE_FMT_SIZE_T
+    if (strlen(b->data) != strlen(contents)) {
+	t_warning("length mismatch: " SvsS, strlen(b->data), strlen(contents));
+    }
+    if (strlen(b->data) != ne_buffer_size(b)) {
+	t_warning("buffer problem: " SvsS,
+		  strlen(b->data), ne_buffer_size(b));
+    }
+#undef SvsS
+
+    ret = memcmp(b->data, contents, ne_buffer_size(b));
+    ne_buffer_destroy(b);
+
+    return ret;
 }
